@@ -452,9 +452,682 @@ assert stored_hash == computed_hash, "Audit record integrity compromised!"
 
 ---
 
-## 3. Audit Enrichment Pipeline
+## 3. External Audit Log Integration
 
-### 3.1 Enrichment Architecture
+### 3.1 Complete Audit Picture Requirements
+
+**Challenge:** Platform audit events alone provide an incomplete picture. A complete audit trail requires correlation with external systems:
+
+1. **Identity Provider (IDP) Logs:**
+   - User authentication events (login, logout, MFA)
+   - SSO session creation and termination
+   - Password changes, account lockouts
+   - Example IDPs: Okta, Azure AD, Auth0, Ping Identity
+
+2. **Authorization Provider Logs:**
+   - OPA policy decision logs (already integrated)
+   - AWS IAM CloudTrail events (if cross-account access)
+   - Third-party authorization systems
+
+3. **Infrastructure Audit Logs:**
+   - Database access logs (RDS, DynamoDB)
+   - Network flow logs (VPC Flow Logs)
+   - API Gateway access logs
+
+4. **Application Security Logs:**
+   - WAF logs (blocked requests, threats)
+   - Security scanning results
+   - Intrusion detection alerts
+
+**Complete Audit Scenario Example:**
+
+```
+Question: "Who accessed PII data for user-12345 on 2025-12-10?"
+
+Complete Answer Requires:
+1. EEMP Audit: Event published/consumed (event.published, event.consumed)
+2. IDP Logs: Who authenticated at that time? (okta.user.session.start)
+3. OPA Logs: Was access authorized? (policy.evaluated → allow)
+4. Database Logs: Was PII data queried? (rds.query.executed)
+5. Network Logs: Which IP address? (vpc.flow.connection)
+
+Without integration, each system must be queried separately.
+```
+
+### 3.2 External Log Integration Architecture
+
+**Federated Query Model:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                External Audit Log Integration                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  EEMP Unified Audit Query Service                          │    │
+│  │                                                             │    │
+│  │  Receives query: "All events for actor=user-12345          │    │
+│  │                   on 2025-12-10"                           │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│         │                                                            │
+│         │ Fan-out parallel queries                                  │
+│         ▼                                                            │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    Query Federation Layer                     │  │
+│  │  (Lambda or ECS service with async query orchestration)      │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│         │                                                            │
+│         ├────────────┬────────────┬────────────┬────────────┐      │
+│         ▼            ▼            ▼            ▼            ▼      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │
+│  │  EEMP    │ │   IDP    │ │   OPA    │ │   RDS    │ │  VPC   │ │
+│  │  Audit   │ │   Logs   │ │   Logs   │ │   Logs   │ │  Logs  │ │
+│  │  (S3)    │ │  (API)   │ │  (S3)    │ │  (S3)    │ │  (S3)  │ │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └────────┘ │
+│         │            │            │            │            │      │
+│         │ Query DDB  │ Query API  │ Query      │ Query      │     │
+│         │ + S3       │ (Okta,etc) │ Athena     │ Athena     │     │
+│         ▼            ▼            ▼            ▼            ▼      │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │              Result Aggregation & Correlation                 │ │
+│  │                                                               │ │
+│  │  - Merge results by timestamp and correlation_id             │ │
+│  │  - Enrich EEMP events with IDP authentication context        │ │
+│  │  - Link OPA decisions to platform events                     │ │
+│  │  - Add database query context to event access                │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│         │                                                            │
+│         ▼                                                            │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              Unified Audit Timeline Response                  │  │
+│  │                                                               │  │
+│  │  [                                                            │  │
+│  │    {                                                          │  │
+│  │      "timestamp": "2025-12-10T10:29:45Z",                    │  │
+│  │      "source": "okta",                                       │  │
+│  │      "event_type": "user.session.start",                     │  │
+│  │      "actor": "user-12345",                                  │  │
+│  │      "details": { "mfa_verified": true, "ip": "203.0.113.5" }│  │
+│  │    },                                                         │  │
+│  │    {                                                          │  │
+│  │      "timestamp": "2025-12-10T10:30:00Z",                    │  │
+│  │      "source": "eemp",                                       │  │
+│  │      "event_type": "event.published",                        │  │
+│  │      "actor": "user-12345",                                  │  │
+│  │      "correlation_id": "trace-abc-123"                       │  │
+│  │    },                                                         │  │
+│  │    {                                                          │  │
+│  │      "timestamp": "2025-12-10T10:30:01Z",                    │  │
+│  │      "source": "opa",                                        │  │
+│  │      "event_type": "policy.evaluated",                       │  │
+│  │      "decision": "allow",                                    │  │
+│  │      "correlation_id": "trace-abc-123"                       │  │
+│  │    }                                                          │  │
+│  │  ]                                                            │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 IDP Log Integration
+
+**Option 1: Real-Time Streaming (Preferred)**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    IDP Event Streaming (Okta Example)                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Okta System Log API (Event Hooks)                                  │
+│         │                                                            │
+│         │ Webhook: POST https://api.eemp.company.com/webhooks/okta  │
+│         │ Events: user.session.start, user.session.end,             │
+│         │         user.authentication.*, policy.evaluate.*          │
+│         ▼                                                            │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  EEMP Webhook Receiver (API Gateway + Lambda)              │    │
+│  │                                                             │    │
+│  │  1. Receive Okta event                                     │    │
+│  │  2. Validate webhook signature                             │    │
+│  │  3. Transform to EEMP audit format                         │    │
+│  │  4. Enrich with user details                               │    │
+│  │  5. Write to Kinesis audit-events-stream                   │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│         │                                                            │
+│         ▼                                                            │
+│  Standard EEMP Audit Pipeline (Enrichment → S3 → DynamoDB)          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Okta Event Hook Configuration:**
+
+```json
+{
+  "name": "EEMP Audit Trail Integration",
+  "events": {
+    "type": "EVENT_TYPE",
+    "items": [
+      "user.session.start",
+      "user.session.end",
+      "user.authentication.authenticate",
+      "user.authentication.sso",
+      "user.account.lock",
+      "user.account.unlock",
+      "policy.evaluate_sign_on"
+    ]
+  },
+  "channel": {
+    "type": "HTTP",
+    "version": "1.0.0",
+    "config": {
+      "uri": "https://api.eemp.company.com/webhooks/okta",
+      "headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer ${secret_token}"
+        }
+      ]
+    }
+  }
+}
+```
+
+**Transform Okta Event to EEMP Format:**
+
+```python
+def transform_okta_event(okta_event):
+    """
+    Transform Okta System Log event to EEMP audit format
+    """
+    return {
+        'audit_id': generate_uuid(),
+        'timestamp': okta_event['published'],
+        'event_type': f"idp.okta.{okta_event['eventType']}",
+        'source': 'external',
+
+        'actor': {
+            'type': 'user',
+            'id': okta_event['actor']['id'],
+            'name': okta_event['actor']['displayName'],
+            'email': okta_event['actor']['alternateId'],
+            'ip_address': okta_event['client']['ipAddress'],
+            'user_agent': okta_event['client']['userAgent']['rawUserAgent']
+        },
+
+        'source': {
+            'system': 'okta',
+            'component': 'identity-provider',
+            'external': True
+        },
+
+        'event': {
+            'event_id': okta_event['uuid'],
+            'correlation_id': okta_event.get('transactionId'),  # For tracing
+            'outcome': okta_event['outcome']['result'],  # SUCCESS, FAILURE
+            'reason': okta_event['outcome'].get('reason')
+        },
+
+        'enrichment': {
+            'idp_details': {
+                'session_id': okta_event.get('authenticationContext', {}).get('externalSessionId'),
+                'mfa_verified': is_mfa_verified(okta_event),
+                'authentication_provider': okta_event.get('authenticationContext', {}).get('authenticationProvider'),
+                'device_fingerprint': okta_event['client'].get('device')
+            }
+        },
+
+        'compliance': {
+            'retention_years': 7,
+            'regulatory_scope': ['SOX', 'GDPR'],
+            'data_sensitivity': 'confidential'
+        }
+    }
+```
+
+**Option 2: Periodic Polling (Fallback)**
+
+```python
+# Scheduled Lambda (runs every 5 minutes)
+def poll_okta_logs():
+    """
+    Poll Okta System Log API for recent events
+    """
+    # Query Okta API for events since last poll
+    since = get_last_poll_timestamp()
+
+    response = requests.get(
+        'https://company.okta.com/api/v1/logs',
+        params={
+            'since': since,
+            'limit': 1000,
+            'filter': 'eventType sw "user." or eventType sw "policy."'
+        },
+        headers={'Authorization': f'SSWS {okta_api_token}'}
+    )
+
+    events = response.json()
+
+    # Transform and write to audit stream
+    for okta_event in events:
+        eemp_event = transform_okta_event(okta_event)
+        kinesis.put_record(
+            StreamName='audit-events-stream',
+            Data=json.dumps(eemp_event),
+            PartitionKey=eemp_event['actor']['id']
+        )
+
+    # Update last poll timestamp
+    update_last_poll_timestamp(max(e['published'] for e in events))
+```
+
+### 3.4 OPA Log Integration
+
+**OPA Logs Already Captured (Internal):**
+
+Since OPA runs as sidecar in EEMP services, policy decisions are already captured. However, for external OPA deployments:
+
+```python
+# OPA Decision Log Plugin Configuration
+{
+  "decision_logs": {
+    "service": "eemp_audit_stream",
+    "reporting": {
+      "min_delay_seconds": 1,
+      "max_delay_seconds": 10
+    },
+    "resource": "/logs"
+  }
+}
+
+# OPA sends decision logs to EEMP endpoint
+POST https://api.eemp.company.com/webhooks/opa
+{
+  "labels": {
+    "app": "eemp-subscription-service"
+  },
+  "decision_id": "uuid-5678",
+  "timestamp": "2025-12-10T10:30:00.123Z",
+  "input": {
+    "subscriber": {
+      "application_id": "notifications-service",
+      "tenant_id": "tenant-001"
+    },
+    "event_type": "user.created"
+  },
+  "result": true,
+  "metrics": {
+    "timer_rego_query_eval_ns": 5000000
+  }
+}
+```
+
+### 3.5 Database Audit Log Integration
+
+**RDS PostgreSQL Audit Logs → S3:**
+
+```yaml
+# Enable PostgreSQL pgAudit extension
+rds_postgresql:
+  parameter_group:
+    shared_preload_libraries: pgaudit
+    pgaudit.log: 'all'  # Log all queries
+    log_destination: 'csvlog'
+
+  log_export_to_s3:
+    enabled: true
+    s3_bucket: eemp-database-audit-logs
+    s3_prefix: postgresql/
+    retention_days: 90
+```
+
+**Query Database Logs via Athena:**
+
+```sql
+-- Create Athena table for RDS logs
+CREATE EXTERNAL TABLE rds_audit_logs (
+  log_time TIMESTAMP,
+  user_name STRING,
+  database_name STRING,
+  process_id INT,
+  connection_from STRING,
+  session_id STRING,
+  session_line_num BIGINT,
+  command_tag STRING,
+  session_start_time TIMESTAMP,
+  virtual_transaction_id STRING,
+  transaction_id BIGINT,
+  error_severity STRING,
+  sql_state_code STRING,
+  message STRING,
+  detail STRING,
+  hint STRING,
+  internal_query STRING,
+  internal_query_pos INT,
+  context STRING,
+  query STRING,
+  query_pos INT,
+  location STRING,
+  application_name STRING
+)
+PARTITIONED BY (year INT, month INT, day INT)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+WITH SERDEPROPERTIES ('field.delim' = ',', 'serialization.format' = ',')
+LOCATION 's3://eemp-database-audit-logs/postgresql/';
+
+-- Query: Find database queries related to specific event
+SELECT
+  log_time,
+  user_name,
+  connection_from,
+  command_tag,
+  query
+FROM rds_audit_logs
+WHERE query LIKE '%user-12345%'
+  AND year = 2025 AND month = 12 AND day = 10
+ORDER BY log_time;
+```
+
+### 3.6 Unified Query API
+
+**Federated Query Implementation:**
+
+```python
+# unified-audit-query/handler.py
+import asyncio
+from typing import List, Dict
+
+async def unified_audit_query(query_params: Dict) -> List[Dict]:
+    """
+    Query multiple audit sources in parallel and merge results
+    """
+    actor_id = query_params['actor_id']
+    start_time = query_params['start_time']
+    end_time = query_params['end_time']
+
+    # Fan-out parallel queries
+    tasks = [
+        query_eemp_audit(actor_id, start_time, end_time),
+        query_idp_logs(actor_id, start_time, end_time),
+        query_opa_logs(actor_id, start_time, end_time),
+        query_database_logs(actor_id, start_time, end_time),
+        query_vpc_logs(actor_id, start_time, end_time)
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Merge and sort by timestamp
+    all_events = []
+    for source_results in results:
+        if isinstance(source_results, Exception):
+            logger.error(f"Query failed: {source_results}")
+            continue
+        all_events.extend(source_results)
+
+    all_events.sort(key=lambda e: e['timestamp'])
+
+    # Correlate events by correlation_id
+    correlated_events = correlate_by_id(all_events)
+
+    # Enrich EEMP events with IDP context
+    enriched_events = enrich_with_idp_context(correlated_events)
+
+    return enriched_events
+
+async def query_eemp_audit(actor_id: str, start_time: str, end_time: str):
+    """Query EEMP audit trail (DynamoDB + S3)"""
+    # Query DynamoDB GSI (ActorIndex)
+    response = dynamodb.query(
+        TableName='audit-events-index',
+        IndexName='ActorIndex',
+        KeyConditionExpression='actor_id = :actor AND #ts BETWEEN :start AND :end',
+        ExpressionAttributeNames={'#ts': 'timestamp'},
+        ExpressionAttributeValues={
+            ':actor': actor_id,
+            ':start': start_time,
+            ':end': end_time
+        }
+    )
+
+    # Fetch full records from S3
+    events = []
+    for item in response['Items']:
+        full_record = await fetch_from_s3_async(item['s3_object_key'])
+        events.append(full_record)
+
+    return events
+
+async def query_idp_logs(actor_id: str, start_time: str, end_time: str):
+    """Query IDP logs (Okta API)"""
+    # If IDP logs are in S3 (streamed via webhook), query S3
+    if IDP_LOGS_IN_S3:
+        return await query_s3_idp_logs(actor_id, start_time, end_time)
+
+    # Otherwise, query IDP API directly
+    response = await http_client.get(
+        f'https://company.okta.com/api/v1/logs',
+        params={
+            'since': start_time,
+            'until': end_time,
+            'filter': f'actor.id eq "{actor_id}"',
+            'limit': 1000
+        },
+        headers={'Authorization': f'SSWS {okta_api_token}'}
+    )
+
+    okta_events = response.json()
+
+    # Transform to EEMP format
+    return [transform_okta_event(e) for e in okta_events]
+
+async def query_opa_logs(actor_id: str, start_time: str, end_time: str):
+    """Query OPA decision logs (Athena on S3)"""
+    query = f"""
+        SELECT *
+        FROM opa_decision_logs
+        WHERE input.subscriber.application_id = '{actor_id}'
+          AND timestamp BETWEEN '{start_time}' AND '{end_time}'
+        ORDER BY timestamp
+    """
+
+    return await execute_athena_query_async(query)
+
+async def query_database_logs(actor_id: str, start_time: str, end_time: str):
+    """Query RDS audit logs (Athena on S3)"""
+    query = f"""
+        SELECT
+          log_time as timestamp,
+          'rds' as source,
+          'database.query.executed' as event_type,
+          user_name as actor_id,
+          query as details
+        FROM rds_audit_logs
+        WHERE (query LIKE '%{actor_id}%' OR user_name LIKE '%{actor_id}%')
+          AND log_time BETWEEN TIMESTAMP '{start_time}' AND TIMESTAMP '{end_time}'
+        ORDER BY log_time
+    """
+
+    return await execute_athena_query_async(query)
+
+def correlate_by_id(events: List[Dict]) -> List[Dict]:
+    """
+    Group events by correlation_id for timeline reconstruction
+    """
+    correlation_map = {}
+
+    for event in events:
+        corr_id = event.get('event', {}).get('correlation_id') or event.get('correlation_id')
+        if corr_id:
+            if corr_id not in correlation_map:
+                correlation_map[corr_id] = []
+            correlation_map[corr_id].append(event)
+
+    # Attach correlated events to each event
+    for event in events:
+        corr_id = event.get('event', {}).get('correlation_id') or event.get('correlation_id')
+        if corr_id:
+            event['correlated_events'] = correlation_map[corr_id]
+
+    return events
+
+def enrich_with_idp_context(events: List[Dict]) -> List[Dict]:
+    """
+    Enrich EEMP events with IDP authentication context
+    """
+    # Find IDP authentication events
+    idp_sessions = {}
+    for event in events:
+        if event.get('source', {}).get('system') == 'okta':
+            if 'session.start' in event['event_type']:
+                session_id = event.get('enrichment', {}).get('idp_details', {}).get('session_id')
+                if session_id:
+                    idp_sessions[session_id] = event
+
+    # Enrich EEMP events with IDP context
+    for event in events:
+        if event.get('source', {}).get('system') == 'eemp':
+            # Find matching IDP session by timestamp proximity
+            event_time = datetime.fromisoformat(event['timestamp'])
+            closest_session = find_closest_session(event_time, idp_sessions)
+
+            if closest_session:
+                if 'enrichment' not in event:
+                    event['enrichment'] = {}
+                event['enrichment']['authentication_context'] = {
+                    'session_id': closest_session.get('enrichment', {}).get('idp_details', {}).get('session_id'),
+                    'mfa_verified': closest_session.get('enrichment', {}).get('idp_details', {}).get('mfa_verified'),
+                    'authentication_time': closest_session['timestamp'],
+                    'ip_address': closest_session['actor']['ip_address']
+                }
+
+    return events
+```
+
+### 3.7 Real-Time Correlation via Correlation ID
+
+**Correlation ID Propagation:**
+
+```
+1. User authenticates to Okta
+   → Okta generates session_id: "sess-abc-123"
+   → EEMP captures via webhook: correlation_id = "sess-abc-123"
+
+2. User accesses EEMP Portal
+   → Portal includes session_id in JWT token
+   → API Gateway extracts: correlation_id = "sess-abc-123"
+
+3. User publishes event
+   → Publisher Service includes correlation_id in audit event
+   → EEMP Audit: correlation_id = "sess-abc-123"
+
+4. OPA evaluates policy
+   → OPA decision includes correlation_id
+   → OPA Audit: correlation_id = "sess-abc-123"
+
+5. Database query executed
+   → Application context includes correlation_id
+   → RDS Audit: application_name = "eemp-{correlation_id}"
+
+Result: All audit logs linked by correlation_id for complete trace
+```
+
+**API Response with External Logs:**
+
+```json
+GET /api/v1/audit/unified?actor_id=user-12345&start_time=2025-12-10T10:00:00Z
+
+Response:
+{
+  "actor_id": "user-12345",
+  "timeline": [
+    {
+      "timestamp": "2025-12-10T10:29:45Z",
+      "source": "okta",
+      "event_type": "idp.okta.user.session.start",
+      "actor": {"id": "user-12345", "email": "john.doe@example.com"},
+      "details": {
+        "mfa_verified": true,
+        "ip_address": "203.0.113.5",
+        "session_id": "sess-abc-123"
+      }
+    },
+    {
+      "timestamp": "2025-12-10T10:30:00Z",
+      "source": "eemp",
+      "event_type": "event.published",
+      "correlation_id": "sess-abc-123",
+      "event": {"event_id": "evt-uuid-9876", "event_type": "user.created"},
+      "enrichment": {
+        "authentication_context": {
+          "session_id": "sess-abc-123",
+          "mfa_verified": true,
+          "authentication_time": "2025-12-10T10:29:45Z"
+        }
+      }
+    },
+    {
+      "timestamp": "2025-12-10T10:30:01Z",
+      "source": "opa",
+      "event_type": "policy.evaluated",
+      "correlation_id": "sess-abc-123",
+      "decision": "allow",
+      "policy_version": "1.2.0"
+    },
+    {
+      "timestamp": "2025-12-10T10:30:02Z",
+      "source": "rds",
+      "event_type": "database.query.executed",
+      "correlation_id": "sess-abc-123",
+      "details": {
+        "query": "INSERT INTO users (id, email) VALUES ('user-12345', ...)",
+        "user_name": "eemp_app"
+      }
+    }
+  ],
+  "summary": {
+    "total_events": 4,
+    "sources": ["okta", "eemp", "opa", "rds"],
+    "time_span_seconds": 17,
+    "mfa_verified": true,
+    "policy_decision": "allow"
+  }
+}
+```
+
+### 3.8 External Log Storage Recommendations
+
+**Centralized External Logs in S3:**
+
+```
+s3://eemp-external-audit-logs/
+  idp/okta/
+    year=2025/month=12/day=10/hour=10/
+      okta-events-{timestamp}.json
+
+  opa/
+    year=2025/month=12/day=10/hour=10/
+      opa-decisions-{timestamp}.json
+
+  rds/
+    year=2025/month=12/day=10/
+      postgresql-audit.csv
+
+  vpc/
+    year=2025/month=12/day=10/
+      flow-logs.parquet
+```
+
+**Benefits:**
+- Unified storage location for all audit sources
+- Consistent partitioning strategy (time-based)
+- Single Athena database for federated queries
+- Lifecycle policies apply to all external logs
+
+---
+
+## 4. Audit Enrichment Pipeline
+
+### 4.1 Enrichment Architecture
 
 **Real-Time Enrichment Pipeline:**
 
